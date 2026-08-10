@@ -6,7 +6,7 @@
 
 ## 目录结构
 
-按「领域 → 细分领域」组织，每个领域一个目录，每个细分领域一个 Markdown 文件，每个文件 20 道题。
+按「领域 → 细分领域」组织，每个领域一个目录，每个细分领域一个 Markdown 文件。每个文件包含 **20 道基础题**；部分文件末尾另附 **Q21 起的综合场景题**（跨知识点、工程复盘类，如 devops 领域各文件已追加 Q21-Q23）。
 
 ```
 interview-docs/
@@ -44,6 +44,22 @@ interview-docs/
 │   ├── postgresql.md                 # PostgreSQL
 │   ├── redis.md                      # Redis
 │   └── sql.md                        # SQL
+├── devops/                           # 运维与交付
+│   # 领域模块
+│   ├── ci-cd.md                      # CI/CD 流水线与发布策略
+│   ├── docker.md                     # 容器化
+│   ├── kubernetes.md                 # Kubernetes
+│   ├── terraform.md                  # 基础设施即代码（IaC）
+│   ├── monitoring.md                 # 监控与可观测性
+│   ├── sre.md                        # SRE 与可靠性工程
+│   ├── linux-shell.md                # Linux 运维实操
+│   ├── cloud.md                      # 云平台基础
+│   # 工具专版
+│   ├── jenkins.md                    # Jenkins
+│   ├── gitlab-ci-actions.md          # GitLab CI / GitHub Actions
+│   ├── ansible.md                    # Ansible
+│   ├── helm.md                       # Helm
+│   └── nginx.md                      # Nginx
 └── general/                          # 通用技能
     ├── web.md                        # Web 与 HTTP
     ├── cyber-security.md             # 网络安全
