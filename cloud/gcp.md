@@ -351,4 +351,179 @@ IaC 落地我按"权限 → 状态 → 模块"三件事设计。权限：建一�
 
 分工原则是"GHA 做触发与质量门禁，Cloud Build 做构建，Cloud Deploy 做发布，Artifact Registry 做制品仓库"。GitHub Actions 工作流：`push` 到 main 触发 → `google-github-actions/auth`（用 Workflow Identity Federation，CI 以 SA `gh-deploy@proj` 身份执行，无需 key）→ 跑单测/Lint → `gcloud builds submit --config=cloudbuild.yaml --substitutions=_COMMIT_SHA=${GITHUB_SHA}`。cloudbuild.yaml 里做两件事：用 docker build 出镜像（`--cache-from` 复用层缓存，构建时间从 5 分钟压到 90 秒）、推送到 Artifact Registry（`$REGION-docker.pkg.dev/$PROJECT/repo/app:${_COMMIT_SHA}`，开漏洞扫描，高危 CVE 阻断 push 或阻断 deploy）。发布用 Cloud Deploy：定义 delivery pipeline `staging → prod`（`gcloud deploy apply --file=pipeline.yaml`），GHA 里调 `gcloud deploy releases create rel-${GITHUB_SHA} --delivery-pipeline=app-pipe --to-target=staging`；prod 发布走金丝雀：rollout 先发 5% 流量（`--canary` + 时间窗），Cloud Deploy 自动用 GKE Service 的 `spec.traffic` 权重切流（金丝雀发布由 rollout 的 `canaryDeployment` 阶段管理），观测 Cloud Monitoring 的错误率 SLO 通过才自动推进 100%，失败则 `--rollback` 自动回滚上一个 rollout。为什么不让 GHA 直接 `kubectl apply`：发布要有"可审计、可暂停、可回滚"的发布对象和策略编排，Cloud Deploy 把 staging→prod 的推进、金丝雀、回滚做成了声明式资源，且天然有 IAM 门禁（谁可以 approve prod 发布）。实践中的坑：一是 Cloud Build 默认在 `us-central1` 或项目默认网络跑，GKE 在共享 VPC 里时构建容器连不上私有集群，要么构建也放同网络（`--vpc-config` 指定子网），要么用 Artifact Registry + Cloud Deploy 走 manifest 下发而非直连集群；二是镜像 tag 用 `latest` 导致无法回滚到确切版本，必须用 SHA 打 tag、`latest` 只作为便捷别名；三是 Artifact Registry 的 vulnerability scanning 默认只扫"推送时"的镜像，要配按天级联扫 + deploy 门禁（`gate`）把"修复中的高危漏洞"拦在 prod 外；四是忘了给 Cloud Build 的 SA 配 `roles/artifactregistry.writer` 和 `roles/clouddeploy.operator`，流水线在最后一步才报权限错，先做权限矩阵检查再上流水线。
 
-**延伸考点：** 金丝雀发布用 Cloud Deploy 的 rollout
+**延伸考点：** 金丝雀发布用 Cloud Deploy 的 rollout 机制和 GKE 里直接改 ingress/service 流量权重实现金丝雀，两者的本质区别是什么？Cloud Build 的 `$_CUSTOM` 与内置 `${_VAR}` 替换规则，自定义替换需要怎么传参？
+
+---
+
+### Q14. API 网关与端点：API Gateway、Cloud Endpoints、服务治理怎么选？
+
+**问题：** 公司要把内部服务暴露成对外的 HTTP API，需要统一鉴权、限流、版本管理和监控。API Gateway 和 Cloud Endpoints（基于 ESPv2）怎么选？它们各自适合什么场景？在 GCP 里 API 网关一般怎么部署在服务前面？
+
+**期望加分项：**
+- 能说清两者定位差异：API Gateway 是托管网关（OpenAPI/Cloud Endpoints 配置 + 策略挂载），Cloud Endpoints 是基于 Envoy 的 ESPv2 sidecar/独立部署、更贴近服务
+- 能说明网关职责：认证（API key/JWT/OIDC）、配额与限流、转换（gRPC↔JSON）、版本路由、监控
+- 能讲典型组合：API Gateway（对外统一入口）→ Backend（Cloud Run/Cloud Functions/App Engine），通过 OpenAPI 描述服务
+- 有取舍意识：简单场景用 Cloud Run 自带的 ingress 配置 + IAM 就够，不必引入网关
+- 能提到成本与运维：网关的实例数、并发、与 Istio/服务网格的关系
+
+**减分项：**
+- 分不清 API Gateway 与 Cloud Endpoints 的差异
+- 没有"先判断是否需要网关"的边界意识
+- 网关与 Ingress/Load Balancer 的职责混淆
+- 不考虑网关本身的成本与运维开销
+
+**解答：**
+
+先判断是否需要网关：如果只是"鉴权 + 转发"，用负载均衡 + IAM 或各 Serverless 服务的自带能力就能解决；需要"统一 API 契约、配额限流、多协议转换、版本管理"时才上网关。GCP 的官方托管网关是 API Gateway：用 OpenAPI 描述 API（定义端点、参数、鉴权方式、配额），部署后得到一个 HTTPS 端点，请求经它转发到后端（Cloud Run/Cloud Functions/App Engine），支持 API key、JWT、OIDC 鉴权，并内置配额与限流、请求日志、监控。Cloud Endpoints 是另一条路线：基于 ESPv2（Envoy），以 sidecar 或独立 Deployment 的方式部署在服务前面，同样读 OpenAPI/gRPC 配置，好处是与服务的网络拓扑更贴近（可在 GKE/Compute 上跑），但对运维要求更高。选型经验：Serverless 后端 + 对外 API 标准化，选 API Gateway（托管、省心）；已有 GKE 微服务、想在服务内做治理，考虑 ESPv2；如果项目已经上了服务网格（Anthos Service Mesh/Istio），网关的职责会被网格 Gateway 接管，就不必再引入 API Gateway。实践要点：网关前面通常还有全局负载均衡 + Cloud Armor（WAF）做 DDoS 防护；配额限流按 API key 或 JWT 的 claim 配置，避免无鉴权限制导致接口被刷；网关的并发与冷启动会引入延迟，对 P99 敏感的业务要做基准测试。成本上 API Gateway 按调用量计费，低频内部工具可能比直接放负载均衡更贵，选型时要算账。
+
+**延伸考点：** 网关的限流和负载均衡的限流（Cloud Armor rate limit）各自管什么？gRPC 服务转 REST（gRPC↔JSON transcoding）在 ESPv2 上怎么配置？
+
+---
+
+### Q15. 消息与事件：Pub/Sub 与 Kafka 对比、推送订阅与拉取订阅怎么选？
+
+**问题：** 公司有多个微服务要异步解耦：一个高频订单事件流（要按订单 ID 保证顺序）、一个低频业务通知（要推送回调）。用 Pub/Sub 还是 Kafka？Pub/Sub 的订阅（push vs pull）和重试、死信、顺序保证分别怎么用？
+
+**期望加分项：**
+- 能对比两者本质差异：Pub/Sub 是全托管 Serverless（自动伸缩、无集群运维、按量计费、At-least-once），Kafka 是自托管流平台（有分区顺序、精确一次需要自己实现）
+- 能讲 Pub/Sub 的模型：Topic→Subscription（拉取或推送）、ack 超时与 nack 重投、死信队列、重试策略
+- 能讲顺序性的坑：Pub/Sub 只保证消息在 Pub/Sub 层面的全局乱序+单分区内不保证严格顺序，业务顺序要靠排序键 + 消费端约束
+- 能给出选型建议：需要低运维 + 事件驱动 → Pub/Sub；需要流处理/长期存储/严格顺序 → Kafka（或 GCP 的 Dataflow 消费 Pub/Sub）
+- 有实践意识：pull 用 subscriber 库的并发、push 订阅的端点必须是公网可达且需要验证（OIDC）
+
+**减分项：**
+- 不知道 Pub/Sub 的 at-least-once 语义，消费者不做幂等
+- 以为 Pub/Sub 能保证全局顺序
+- 分不清 push 与 pull 订阅的适用场景
+- 不知道 ack deadline 与重投机制
+
+**解答：**
+
+Pub/Sub 是 GCP 的全托管消息服务，核心模型是 Topic（发布端）与 Subscription（消费端，二者解耦）：发布消息到 Topic，多个 Subscription 各自独立消费（发布订阅模式）；Subscription 有 pull（消费者主动拉取）与 push（Pub/Sub 主动 POST 到端点）两种。语义是 at-least-once：消费者必须在 ack 截止时间（ackDeadline，默认 10s 可配到 600s）内 ack，否则消息被重投；因此消费者必须幂等。顺序性要特别注意：Pub/Sub 不提供分区顺序保证（Kafka 靠分区保证有序），业务要顺序就只能通过"排序键 + 单消费者 + 本地重排"近似实现，或者接受少量乱序。与 Kafka 的选型：纯事件驱动、不想运维集群、流量波动大 → Pub/Sub（自动伸缩，按量计费，没有 broker 集群）；需要长保留（Pub/Sub 默认 7 天）、重放、流处理（Dataflow 做窗口聚合）、严格分区顺序 → Kafka（GCP 有 Confluent 或自建）。推送订阅实践：端点必须公网可达（或通过内网使用 push 到 Cloud Run 时做鉴权），Pub/Sub 支持 OIDC token 验证推送请求来源；生产常用"重试策略（min/max 间隔、指数退避）→ 死信 Topic（未确认消息投递到 DLQ）→ 告警"三层兜底。大数据量场景注意：单 Subscription 的吞吐受拉取并发限制，用 subscriber 库（`flow_control` 调 maxOutstandingMessages）控制背压；推送端点过慢会导致消息积压和重复投递。最终建议：把"需要严格顺序的订单流"放 Kafka 或 Dataflow 内做分区，把"通知、审计、解耦事件"放 Pub/Sub，各取所长。
+
+**延伸考点：** Pub/Sub 的 exactly-once 支持（消息去重在订阅端如何实现）？push 订阅和 pull 订阅各自在什么场景下是唯一合理选择？
+
+---
+
+### Q16. Cloud CDN 与边缘网络：缓存、回源、与负载均衡怎么配合？
+
+**问题：** 公司的图片和静态资源流量大、跨地域用户延迟高。用 Cloud CDN 怎么配置？缓存命中率怎么提升？动态内容（API）和静态内容（图片）在边缘侧分别怎么处理？
+
+**期望加分项：**
+- 能讲 Cloud CDN 是挂在负载均衡（后端）上的缓存层，配置在 backend service 的 CDN 设置里
+- 能讲缓存键与缓存策略：基于 URL/查询参数、Cache-Control/Expires、TTL、显式缓存模式
+- 能讲静态资源（图片/JS/CSS）走 CDN 缓存、动态 API 走原站的取舍，以及"缓存 API 响应"的场景（如带鉴权、版本化）
+- 有实践：缓存命中率监控（ratio 与字节命中率）、cache invalidation、预热、signed URL
+- 能说明与 DNS/负载均衡的地域就近（anycast）结合，跨区域访问优化
+
+**减分项：**
+- 把 Cloud CDN 当成独立服务，不知道它挂在负载均衡上
+- 不知道缓存键设计会影响命中率与正确性
+- 动态内容也盲目缓存导致数据不一致
+- 不知道 signed URL/cache invalidation 的用法
+
+**解答：**
+
+Cloud CDN 不是独立产品，而是挂在 HTTP(S) 负载均衡的 backend service 上：为某个 backend（后端服务）开启 Cloud CDN，并配置缓存策略即可。工作流程：用户请求经全局负载均衡（anycast 就近接入边缘）→ 边缘节点查缓存 → 命中直接返回，未命中回源到后端 → 回源响应按规则缓存。核心配置是缓存策略：默认按 `Cache-Control: public, max-age=...` 等响应头生效；也可用"显式缓存模式"强制指定 TTL（如忽略响应头，统一缓存 3600s）；缓存键默认是 URL 路径，可配置是否包含查询参数（`includeQueryString` 白名单/黑名单），查询参数千变万化会打爆缓存键导致命中率低。静态资源（图片/JS/CSS）是 CDN 的主场，配合 `immutable`/`max-age=31536000` + 内容哈希文件名实现长期缓存；动态 API 一般不走缓存，但对"低频变化+高 QPS"的接口（配置类、榜单类）可短 TTL 缓存（5-60s）显著减压，前提是接口幂等且能容忍延迟。提升命中率的手段：URL 规范化（去掉无用参数）、`Cache-Control: s-maxage` 区分 CDN 与浏览器缓存、预热关键资源、版本化路径。失效与安全：`gcloud compute cdn-cache invalidate` 手动失效（有配额、逐个 purge）；私有内容用 signed URL（带过期时间的签名 URL）保护下载；与 Cloud Armor 配合做边缘防护。运维指标盯"缓存命中率（hit ratio）与字节命中率"，低于 70% 说明策略配置或 URL 设计有问题。注意：WebSocket/需要回源的动态请求应跳过 CDN（或配 `no-cache`），否则会出现连接被缓存层干扰的诡异问题。
+
+**延伸考点：** signed URL 与 signed cookie 的区别与适用场景？跨区域访问时，如何用负载均衡的"就近路由"和 CDN 缓存组合降低延迟？
+
+---
+
+### Q17. BigQuery 与数据：分区、聚类、费用模型怎么用才不烧钱？
+
+**问题：** 团队用 BigQuery 做分析，日志表每天几亿行，查询越来越慢、账单越来越高。分区表、聚簇表怎么设计？BigQuery 的费用模型（扫描量计费）对表结构和查询写法有什么约束？
+
+**期望加分项：**
+- 能讲 BigQuery 是无服务器数仓：按扫描字节计费（on-demand）或固定容量（slot 订阅），核心优化点是"少扫数据"
+- 能讲分区（PARTITION BY 按日期）与聚类（CLUSTER BY）的作用：分区裁剪、聚簇减少扫描块
+- 能讲表结构与查询写法约束：避免 `SELECT *`、用列裁剪、避免大范围扫描、物化视图/预聚合
+- 能讲生命周期与成本：分区过期删除、数据从 GCS 外部表、把冷数据迁到 GCS 查、slot 管理
+- 有实践：BigQuery 的查询计划（Explain）、dry run 估算扫描量、信息架构（数据集/权限）
+
+**减分项：**
+- 不知道按扫描量计费，查询写得不加约束
+- 不会用分区/聚簇
+- 不知道 `SELECT *` 在 BigQuery 上的成本放大效应
+- 没有 slot 和并发管理的意识
+
+**解答：**
+
+BigQuery 的计费核心是"扫描字节数"（on-demand 模式按量每 TB 收费，fixed-capacity 模式买 slot 时长），所以一切优化的目标都是"少扫数据"。第一件事是分区：日志类表按天分区（`PARTITION BY DATE(event_time)`），查询带 `WHERE event_time >= ...` 时只扫对应分区（分区裁剪），能把几亿行压到几百万行；未分区表的全表扫描一次就是全量账单。第二件事是聚类：同一分区内按 `CLUSTER BY user_id, region` 聚簇，让相同键的数据物理相邻，范围/等值过滤时跳过无关块，进一步减少扫描；聚类不额外计费但增加写入成本，适合"分区内仍要按某列过滤"的表。第三件事是查询写法：永远不 `SELECT *`（哪怕多 5 个没用的列也翻倍账单），能 `SELECT` 必要列就只选必要列；`LIMIT` 不减少扫描量（照扫全量）；避免在 WHERE 里对分区列做函数包装导致裁剪失效。降本进阶：热数据建物化视图/预聚合表（每小时跑一次定时 SQL 聚合到小表，查询全打小表）；冷数据（90 天前）迁到 GCS 用外部表查，或直接转 BigQuery 分区过期（`partition_expiration_days`）自动删。运维上用好 Query Editor 的 dry run（预览扫描量）和 EXPLAIN 看实际扫描字节，把"大扫描查询"列入评审；对高并发报表团队，固定 slot 配额（如 200 slots）+ 队列管理比按量更可控。权限上数据集级 IAM（`roles/bigquery.dataViewer`）加精细 schema 控制，防止误跑全表查询。最终答案的框架：分区裁剪 → 聚簇缩小扫描块 → 列裁剪 → 预聚合/冷热分离 → 监控扫描量与预算。
+
+**延伸考点：** BigQuery 的 slot 模式与 on-demand 模式各自的成本模型和适用场景？外部表（查 GCS 上的 Parquet）与原生表在性能/成本上的差异？
+
+---
+
+### Q18. 成本管理：Committed Use Discounts、Spot、预算与告警怎么组合？
+
+**问题：** 公司 GCP 账单逐月上涨，主要是常驻的 GKE 节点和 SQL 实例。CUD（承诺使用折扣）、Spot 实例、预算告警各自怎么用？常驻工作负载和可中断工作负载怎么分池？
+
+**期望加分项：**
+- 能讲 CUD：1 年/3 年承诺换取折扣（计算 30-57%，与使用量绑定）、适合稳定常驻负载
+- 能讲 Spot：可中断（30s 抢占通知）、折扣约 60-91%、适合容错负载（批处理、无状态 worker）
+- 能讲预算与告警：`gcloud billing budgets` 设置预算、按阈值告警、与 Pub/Sub/云函数联动自动止损
+- 能讲常驻与 Spot 分池设计：GKE 节点池用 CUD 打底 + Spot 池扩缩
+- 有实践：标签与成本分组、成本分析报表（Cloud Billing 的 Cost Table）、cost anomaly detection
+
+**减分项：**
+- 不知道 CUD 有"承诺=锁定"的约束，随意承诺
+- 把无状态服务也放 Spot（丢失风险）
+- 只看单价不看总成本
+- 没有预算与异常告警
+
+**解答：**
+
+GCP 成本治理三板斧：承诺、Spot、预算。第一板斧 CUD（Committed Use Discounts）：对"稳定常驻"的资源（GKE 常驻节点、Cloud SQL 规格）做 1 年/3 年承诺，换取 30%-57% 折扣；关键约束是承诺后无论用不用都照付（commit 按每小时 vCPU/内存用量抵扣），所以只对"过去 3 个月用量平稳的资源"承诺，且用"组承诺/资源型承诺"避免锁死在具体实例。第二板斧 Spot（原 Preemptible）：可被随时回收（回收前约 30s 通知），折扣高，但只适合容错负载——批处理（Dataflow 默认支持）、无状态 web worker（水平扩展、丢一台无感知）、CI 构建、以及 GKE 里的 spot 节点池。设计上把"打底 + 弹性"分池：常驻 base 池用 CUD 承诺覆盖（保证容量与折扣），弹性高峰池用 Spot 扩（便宜、可丢），Pod 用优先级/污点把关键业务绑 base 池。第三板斧预算与告警：`gcloud billing budgets create` 建预算（按月/按项目），设置 50%/90%/100% 阈值告警，可触发 Pub/Sub 通知，配合云函数做自动止损（如超预算自动关停非核心实例）；配合标签（`labels`/成本分组）把账单按团队/项目拆分，`Cloud Billing` 的 Cost Table / 成本报告做月度归因。还要注意几类隐藏账单：未清理的磁盘快照、跨区域网络流量、BigQuery 的意外大扫描、静态 IP 闲置。最终落地：承诺覆盖底座、Spot 覆盖弹性、预算与标签管住失控，月度成本评审用成本表逐项归因，形成"谁产生成本谁负责"的 FinOps 文化。
+
+**延伸考点：** CUD 与 Cloud SQL 的承诺折扣（灵活承诺）怎么选型？Spot 抢占导致 GKE 缩容抖动，怎么用 PodDisruptionBudget 和节点池污点缓解？
+
+---
+
+### Q19. 混合云与多云：Anthos、GKE Enterprise、Google Distributed Cloud 怎么用？
+
+**问题：** 公司有自建机房（有 Kubernetes 集群）和 GCP 云上资源，想统一管理、统一运维、故障时互备。Anthos 是什么？GKE Enterprise、Google Distributed Cloud 各解决什么问题？"上云又不放弃机房"的常见架构怎么搭？
+
+**期望加分项：**
+- 能讲 Anthos 是 GCP 的混合云/多云平台（不是单一产品，是产品家族：GKE Enterprise、Config Sync、Policy Controller、Connect）
+- 能讲 Google Distributed Cloud（GDC，前 GKE On-Prem）：把 GKE 带到自建机房（VMware/裸金属）
+- 能讲统一治理：Config Sync（GitOps 配置同步）、Policy Controller（OPA/Gatekeeper）、Connect（集群注册与统一控制面）
+- 能讲典型架构：机房 GDC 集群 + 云上 GKE，统一 GitOps 发布，故障时跨环境容灾
+- 有取舍意识：混合云复杂度高、成本高，多数场景"上云"比"混合"更优，给出适用边界
+
+**减分项：**
+- 把 Anthos 当成一个具体软件
+- 不知道 Config Sync/Policy Controller 这些关键组件
+- 没有"什么时候不该用混合云"的边界判断
+- 混同 GKE Standard 与 GDC 的部署位置
+
+**解答：**
+
+先纠正概念：Anthos 不是一款软件，而是 GCP 的"混合云/多云平台"产品家族，核心成员包括：GKE Enterprise（企业版 GKE：多集群管理、配置治理、安全策略、服务网格）、Google Distributed Cloud（GDC，把 GKE 部署到自建机房，支持 VMware 与裸金属）、Config Sync（把 Kubernetes 资源声明式同步到多个集群，Git 是唯一事实源）、Policy Controller（基于 OPA/Gatekeeper 的准入策略，跨集群统一执行）、Connect（把任意 GKE 兼容集群注册进统一控制面）。典型混合云架构：机房跑 GDC 集群承载本地敏感数据与低延迟服务，云上 GKE 承载弹性与创新负载，两处集群都注册到同一控制面；用 Config Sync 从同一个 Git 仓库把应用/配置下发到两边集群（一处发布、处处生效），用 Policy Controller 统一安全基线（比如"所有集群禁止 privileged 容器"），用 Cloud Monitoring 统一监控（Metrics 汇聚）。容灾思路：正常时机房为主，云上按需扩容（突发流量直接扩云上副本）；机房故障时把流量/数据切到云上（依赖数据层的跨环境同步，如 AlloyDB/Spanner 可跨区域，自建库需自行同步）。必须给边界：混合云带来的是统一治理，但代价是复杂度（两套网络的专线/VPN、两处集群的版本一致、跨环境身份打通）与成本（GDC 有硬件/许可成本）；如果业务没有"数据必须留在本地"的合规/延迟约束，优先纯上云，把精力花在云上高可用上而不是混合。选型判断：合规要求数据本地留存 → GDC + 云上弹性；只想统一管理多云 → 用 Connect + Config Sync 管理自管集群；已有 Istio 的微服务治理 → GKE Enterprise 的服务网格能力。
+
+**延伸考点：** Config Sync 的 GitOps 与 Argo CD 的差异？GDC 上跑的无状态负载在云上扩副本时，数据层如何保持一致（多活 vs 主备）？
+
+---
+
+### Q20. GCP 认证与知识面：ACE/PCA 考察什么，怎么备考最高效？
+
+**问题：** 候选人说自己有 GCP 认证（或想考 ACE/PCA）。ACE（Associate Cloud Engineer）和 PCA（Professional Cloud Architect）分别考察什么？核心知识面有哪些？备考和面试复习的侧重点怎么安排？
+
+**期望加分项：**
+- 能说清两级认证定位：ACE 是"会用云资源"（操作层：控制台/gcloud/部署），PCA 是"会设计架构"（方案层：选型、权衡、迁移、最佳实践）
+- 能列出核心知识面：Compute（GCE/GKE/Cloud Run）、存储（GCS/Persistent Disk）、数据库（Cloud SQL/Spanner/Bigtable/BigQuery）、网络（VPC/LB/DNS/CDN）、IAM 与安全、可观测性（Monitoring/Logging）、成本（CUD/Spot/预算）、CI/CD（Cloud Build/Deploy）
+- 有实操建议：gcloud 命令行熟练度、用考试样例练习、动手建项目（GCP 免费额度）
+- 能结合面试：认证只是敲门砖，关键还是架构决策（选型、权衡、迁移、成本）的实战深度
+- 能提 Well-Architected 式设计视角（可靠性、性能、安全、成本、运维）
+
+**减分项：**
+- 只背题库不知道服务实际怎么用
+- 分不清 ACE/PCA 的能力边界
+- 把认证当"懂 GCP"的全部
+- 说不出任何架构权衡（选型、容灾、成本）的实战细节
+
+**解答：**
+
+GCP 认证分两级：ACE（入门）考察"会不会用"——管理 IAM、部署 GCE/GKE、配置 VPC/存储、用 gcloud/控制台完成运维动作、配置监控告警，偏操作技能；PCA（高级）考察"会不会设计"——给业务场景选服务（存储/计算/数据库）、设计高可用与容灾、规划迁移、权衡成本与性能、遵循 Well-Architected 视角（可靠性、性能、安全、成本、运维）。核心知识面按模块过：计算（GCE 机器类型与 MIG、GKE 的 Autopilot/Standard、Cloud Run/Cloud Functions 的 Serverless 边界）、存储（GCS 存储类与生命周期、Persistent Disk 与快照）、数据库（Cloud SQL/Spanner/Bigtable/Firestore/BigQuery 的选型矩阵是 PCA 必考）、网络（VPC/子网/防火墙、HTTP(S) 负载均衡、Cloud DNS、Cloud CDN）、IAM 与安全（角色体系、服务账号、KMS、组织政策）、可观测性（Cloud Monitoring/Logging/Trace 的组合）、成本（CUD、Spot、预算告警）、CI/CD（Cloud Build/Cloud Deploy/Artifact Registry）。备考效率最高的是"动手 + 官方文档 + 模拟题"三合一：用免费额度建真实项目练一遍（创建 VPC 加 GKE、挂 Cloud SQL、配负载均衡与 CDN、开预算告警），比刷题记得牢；考前做官方模拟题摸清题型。给面试的建议：认证证明"系统学过"，但面试官更在意深度——比如"为什么选 Spanner 而不是 Cloud SQL"（全球一致、水平扩展 vs 成本）、"金丝雀发布怎么做"（Cloud Deploy 机制）、"账单暴涨怎么归因"（标签 + 成本表），这些都要有实战案例支撑。一句话总结：认证是下限，架构决策的深度才是上限。
+
+**延伸考点：** 如果你是面试官，会怎么设计一道"GCP 架构"场景题来区分背题者和实战者？PCA 里常考的"迁移 6R 与 GCP 服务映射"怎么答？

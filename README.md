@@ -53,13 +53,26 @@ interview-docs/
 │   ├── monitoring.md                 # 监控与可观测性
 │   ├── sre.md                        # SRE 与可靠性工程
 │   ├── linux-shell.md                # Linux 运维实操
-│   ├── cloud.md                      # 云平台基础
 │   # 工具专版
 │   ├── jenkins.md                    # Jenkins
 │   ├── gitlab-ci-actions.md          # GitLab CI / GitHub Actions
 │   ├── ansible.md                    # Ansible
 │   ├── helm.md                       # Helm
 │   └── nginx.md                      # Nginx
+├── cloud/                            # 云计算
+│   # 领域模块
+│   ├── cloud-foundation.md           # 云计算基础
+│   ├── cloud-network.md              # 云网络
+│   ├── cloud-storage.md              # 云存储
+│   ├── cloud-security.md             # 云安全与合规
+│   ├── cloud-native.md               # 云原生
+│   ├── cloud-cost.md                 # 成本优化（FinOps）
+│   ├── cloud-architecture.md         # 云架构设计
+│   ├── cloud-migration.md            # 云迁移
+│   # 厂商专版
+│   ├── aws.md                        # AWS
+│   ├── gcp.md                        # GCP
+│   └── aliyun.md                     # 阿里云
 └── general/                          # 通用技能
     ├── web.md                        # Web 与 HTTP
     ├── cyber-security.md             # 网络安全
